@@ -1,0 +1,29 @@
+[package]
+name = "shared-altsd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = "0.3"
+async-stream = "0.3"
+#elliptic-curve = { version = "0.12.3", features = ["ecdh"] }
+k256 = { version = "0.11.6", features = ["ecdh"] }
+env_logger = "0.10"
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+itertools = "0.10"
+log = "0.4"
+prost = "0.11"
+rand_core = "0.6.4"
+ring = "0.16.20"
+rustls-pemfile = "1.0.1"
+sha2 = "0.10.6"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.8"
+#tonic = { path = "/usr/local/src/tonic/tonic" }
+users = "0.11"
+x509-parser = "0.14.0"
+
+[build-dependencies]
+tonic-build = "0.8"

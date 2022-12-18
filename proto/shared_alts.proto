@@ -1,0 +1,37 @@
+syntax = "proto2";
+
+import "transport_security_common.proto";
+
+package shared_alts;
+
+// The protocol is based largely on ECDHE_RSA from RFC4492.
+
+message Hello {
+  optional string magic = 1;
+  optional bytes random = 2;
+  optional bytes certificate = 3;
+}
+
+enum NamedCurve {
+  SECP256K1 = 22;  // RFC4492 section 5.1.1
+}
+
+message SignedParams {
+  optional NamedCurve named_curve = 1;
+  optional bytes ec_public_key = 2;
+  optional string identity_username = 3;
+
+  // Stuff we do not care about but which must be relayed to the other side.
+  repeated string application_protocols = 4;
+  optional grpc.gcp.RpcProtocolVersions rpc_versions = 5;
+}
+
+message KeyExchange {
+  optional bytes signed_params = 1;  // Serialised SignedParams
+  optional bytes signature = 2;
+}
+
+message ALTS_Message {
+  optional Hello hello = 1;
+  optional KeyExchange key_exchange = 2;
+}
