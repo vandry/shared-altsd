@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::Arc;
 use tonic::{Code, Status};
-use x509_parser::parse_x509_certificate;
+use x509_parser::{parse_x509_certificate, time::ASN1Time};
 
 use crate::config::CertAndKey;
 
@@ -38,6 +38,7 @@ pub struct Exchange {
     ecdhe_shared: Option<SharedSecret>,
     peer_cert_bytes: Option<Vec<u8>>,
     peer_public_key: Option<signature::UnparsedPublicKey<Vec<u8>>>,
+    now: ASN1Time,
 
     // If empty, ignore.
     // If non-empty, fail the handshake if none match the remote identity.
@@ -54,7 +55,7 @@ pub struct Exchange {
 }
 
 impl Exchange {
-    pub fn new(local_username: &str, cert_and_key: Arc<CertAndKey>) -> Self {
+    pub fn new(local_username: &str, cert_and_key: Arc<CertAndKey>, now: ASN1Time) -> Self {
         Self {
             local_username: String::from(local_username),
             cert_and_key,
@@ -69,6 +70,7 @@ impl Exchange {
             peer_rpc_versions: None,
             peer_username: None,
             target_identities: Vec::new(),
+            now,
         }
     }
 
@@ -112,6 +114,15 @@ impl Exchange {
         }?;
         self.peer_public_key = Some(signature::UnparsedPublicKey::new(
             &signature::RSA_PKCS1_2048_8192_SHA256, cert.public_key().subject_public_key.data.to_vec()));
+
+        let validity = cert.validity();
+        if self.now.lt(&validity.not_before) {
+            return Err(Status::new(Code::Unauthenticated, "Certificate is only valid in the future"));
+        }
+        if self.now.gt(&validity.not_after) {
+            return Err(Status::new(Code::Unauthenticated, "Certificate is expired"));
+        }
+
         self.peer_cert_bytes = Some(peer_cert_bytes);
 
         match hello.random

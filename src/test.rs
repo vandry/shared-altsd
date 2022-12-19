@@ -1,6 +1,8 @@
 use prost::Message;
 use std::collections::HashMap;
 use std::io::{BufRead, Cursor};
+use tonic::Code;
+use x509_parser::time::ASN1Time;
 
 use crate::config::Config;
 use crate::server::HandshakeProcessor;
@@ -10,6 +12,8 @@ use crate::grpc::gcp::{HandshakerResp, HandshakerStatus, ServerHandshakeParamete
 use crate::grpc::gcp::handshaker_req::ReqOneof::{ClientStart, ServerStart, Next};
 use crate::grpc::gcp::HandshakeProtocol::{Alts, Tls};
 use crate::shared_alts_pb::AltsMessage;
+
+const TIME_WHEN_CERT_IS_VALID: i64 = 1671478511;
 
 fn test1_config() -> Config {
     Config::new_from_string("
@@ -185,6 +189,18 @@ SPOKGkn7sXYozFvSfYngf+gO2OgZ1ofN
     ").expect("valid key and cert")
 }
 
+fn make_client() -> HandshakeProcessor {
+    HandshakeProcessor::new(
+        "test-client-user", test1_config().get(),
+        ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID).expect("time"))
+}
+
+fn make_server() -> HandshakeProcessor {
+    HandshakeProcessor::new(
+        "test-server-user", test2_config().get(),
+        ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID).expect("time"))
+}
+
 fn unframe_message(r: &HandshakerResp) -> Option<AltsMessage> {
     if r.out_frames.len() == 0 {
         return None;
@@ -203,7 +219,7 @@ fn unframe_message(r: &HandshakerResp) -> Option<AltsMessage> {
 
 #[tokio::test]
 async fn test_client_rejects_wrong_handshake_protocol() {
-    let mut client = HandshakeProcessor::new("test-client-user", test1_config().get());
+    let mut client = make_client();
 
     let status = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
@@ -217,9 +233,9 @@ async fn test_client_rejects_wrong_handshake_protocol() {
 
 #[tokio::test]
 async fn test_server_rejects_wrong_handshake_protocol() {
-    let mut client = HandshakeProcessor::new("test-server-user", test1_config().get());
+    let mut server = make_server();
 
-    let status = client.step(Ok(HandshakerReq {
+    let status = server.step(Ok(HandshakerReq {
         req_oneof: Some(ServerStart(StartServerHandshakeReq {
             handshake_parameters: HashMap::from([(Tls as i32, ServerHandshakeParameters {
                 record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
@@ -233,7 +249,7 @@ async fn test_server_rejects_wrong_handshake_protocol() {
 
 #[tokio::test]
 async fn test_client_rejects_wrong_record_protocol() {
-    let mut client = HandshakeProcessor::new("test-client-user", test1_config().get());
+    let mut client = make_client();
 
     let status = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
@@ -247,9 +263,9 @@ async fn test_client_rejects_wrong_record_protocol() {
 
 #[tokio::test]
 async fn test_server_rejects_wrong_record_protocol() {
-    let mut client = HandshakeProcessor::new("test-server-user", test1_config().get());
+    let mut server = make_server();
 
-    let status = client.step(Ok(HandshakerReq {
+    let status = server.step(Ok(HandshakerReq {
         req_oneof: Some(ServerStart(StartServerHandshakeReq {
             handshake_parameters: HashMap::from([(Alts as i32, ServerHandshakeParameters {
                 record_protocols: vec![String::from("ridiculous")],
@@ -263,8 +279,8 @@ async fn test_server_rejects_wrong_record_protocol() {
 
 #[tokio::test]
 async fn test_handshake() {
-    let mut client = HandshakeProcessor::new("test-client-user", test1_config().get());
-    let mut server = HandshakeProcessor::new("test-server-user", test2_config().get());
+    let mut client = make_client();
+    let mut server = make_server();
 
     let c1 = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
@@ -336,6 +352,46 @@ async fn test_handshake() {
     assert_eq!(client_result.application_protocol, "fancy");
     assert_eq!(server_result.application_protocol, "fancy");
     assert_eq!(client_result.key_data, server_result.key_data);
+}
+
+#[tokio::test]
+async fn test_rejects_certificate_outside_validity() {
+    for clock_adjust_seconds in [-10000000, 0, 10000000] {
+        let mut client = HandshakeProcessor::new(
+            "test-client-user", test2_config().get(),
+            ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID+clock_adjust_seconds).expect("time"));
+        let mut server = HandshakeProcessor::new(
+            "test-server-user", test2_config().get(),
+            ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID+clock_adjust_seconds).expect("time"));
+
+        let c1 = client.step(Ok(HandshakerReq {
+            req_oneof: Some(ClientStart(StartClientHandshakeReq {
+                handshake_security_protocol: Alts as i32,
+                record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
+                ..StartClientHandshakeReq::default()
+            })),
+        })).await.expect("first HandshakerResp from client");
+
+        let s1 = server.step(Ok(HandshakerReq {
+            req_oneof: Some(ServerStart(StartServerHandshakeReq {
+                handshake_parameters: HashMap::from([(Alts as i32, ServerHandshakeParameters {
+                    record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
+                    ..ServerHandshakeParameters::default()
+                })]),
+                in_bytes: c1.out_frames,
+                ..StartServerHandshakeReq::default()
+            })),
+        })).await;
+
+        if clock_adjust_seconds == 0 {
+            s1.expect("Certificate should be valid now");
+        } else {
+            assert_eq!(s1
+                .expect_err("Certificate should be rejected too early or too late")
+                .code(),
+                Code::Unauthenticated);
+        }
+    }
 }
 
 // TODO(vandry): Test that delivering wrong or duplicated messages.

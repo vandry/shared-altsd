@@ -9,6 +9,7 @@ use tokio_stream::StreamExt;
 use tonic::{Code, Request, Response, Status, Streaming};
 use tonic::transport::server::UdsConnectInfo;
 use users::get_user_by_uid;
+use x509_parser::time::ASN1Time;
 
 use crate::config::{CertAndKey, Config};
 use crate::exchange::{Exchange, record_protocol_supported};
@@ -64,10 +65,10 @@ pub struct HandshakeProcessor {
 }
 
 impl HandshakeProcessor {
-    pub fn new(username: &str, cert_and_key: Arc<CertAndKey>) -> Self {
+    pub fn new(username: &str, cert_and_key: Arc<CertAndKey>, now: ASN1Time) -> Self {
         Self {
             available_bytes: Vec::new(),
-            exchange: Exchange::new(username, cert_and_key),
+            exchange: Exchange::new(username, cert_and_key, now),
             talker: HandshakeProcessorTalker::NotStarted,
             done_sending: false,
         }
@@ -260,7 +261,7 @@ impl HandshakerService for Handshaker {
                 return Err(Status::new(Code::Unauthenticated, "Peer uid corresponds to no user"));
             }
         };
-        let p = HandshakeProcessor::new(&username, self.config.get());
+        let p = HandshakeProcessor::new(&username, self.config.get(), ASN1Time::now());
         Ok(Response::new(Box::pin(p.run(req.into_inner()))))
     }
 }
