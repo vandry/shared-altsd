@@ -1,11 +1,14 @@
+use futures::future::ready;
 use prost::Message;
 use std::collections::HashMap;
 use std::io::{BufRead, Cursor};
-use tonic::Code;
+use std::sync::Arc;
+use tonic::{Code, Status};
 use x509_parser::time::ASN1Time;
 
 use crate::config::Config;
 use crate::server::HandshakeProcessor;
+use crate::tlsa::{TLSAFuture, TLSAProvider};
 
 use crate::grpc::gcp::{HandshakerReq, NextHandshakeMessageReq, StartClientHandshakeReq, StartServerHandshakeReq};
 use crate::grpc::gcp::{HandshakerResp, HandshakerStatus, ServerHandshakeParameters};
@@ -189,16 +192,33 @@ SPOKGkn7sXYozFvSfYngf+gO2OgZ1ofN
     ").expect("valid key and cert")
 }
 
-fn make_client() -> HandshakeProcessor {
-    HandshakeProcessor::new(
-        "test-client-user", test1_config().get(),
-        ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID).expect("time"))
+enum MockTLSAProvider {
+    Good,
+    Error,
 }
 
-fn make_server() -> HandshakeProcessor {
+impl TLSAProvider for MockTLSAProvider {
+    fn background_tlsa_lookup(self: Arc<Self>, _name: String) -> TLSAFuture {
+        let result = match *self {
+            MockTLSAProvider::Good => Ok(Vec::new()),
+            MockTLSAProvider::Error => Err(Status::unavailable("oops")),
+        };
+        Box::pin(ready(result))
+    }
+}
+
+fn make_client(tlsa: MockTLSAProvider) -> HandshakeProcessor<MockTLSAProvider> {
+    HandshakeProcessor::new(
+        "test-client-user", test1_config().get(),
+        ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID).expect("time"),
+        Arc::new(tlsa))
+}
+
+fn make_server(tlsa: MockTLSAProvider) -> HandshakeProcessor<MockTLSAProvider> {
     HandshakeProcessor::new(
         "test-server-user", test2_config().get(),
-        ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID).expect("time"))
+        ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID).expect("time"),
+        Arc::new(tlsa))
 }
 
 fn unframe_message(r: &HandshakerResp) -> Option<AltsMessage> {
@@ -219,7 +239,7 @@ fn unframe_message(r: &HandshakerResp) -> Option<AltsMessage> {
 
 #[tokio::test]
 async fn test_client_rejects_wrong_handshake_protocol() {
-    let mut client = make_client();
+    let mut client = make_client(MockTLSAProvider::Good);
 
     let status = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
@@ -233,7 +253,7 @@ async fn test_client_rejects_wrong_handshake_protocol() {
 
 #[tokio::test]
 async fn test_server_rejects_wrong_handshake_protocol() {
-    let mut server = make_server();
+    let mut server = make_server(MockTLSAProvider::Good);
 
     let status = server.step(Ok(HandshakerReq {
         req_oneof: Some(ServerStart(StartServerHandshakeReq {
@@ -249,7 +269,7 @@ async fn test_server_rejects_wrong_handshake_protocol() {
 
 #[tokio::test]
 async fn test_client_rejects_wrong_record_protocol() {
-    let mut client = make_client();
+    let mut client = make_client(MockTLSAProvider::Good);
 
     let status = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
@@ -263,7 +283,7 @@ async fn test_client_rejects_wrong_record_protocol() {
 
 #[tokio::test]
 async fn test_server_rejects_wrong_record_protocol() {
-    let mut server = make_server();
+    let mut server = make_server(MockTLSAProvider::Good);
 
     let status = server.step(Ok(HandshakerReq {
         req_oneof: Some(ServerStart(StartServerHandshakeReq {
@@ -277,11 +297,7 @@ async fn test_server_rejects_wrong_record_protocol() {
     assert!(status.message().contains("record_protocol"));
 }
 
-#[tokio::test]
-async fn test_handshake() {
-    let mut client = make_client();
-    let mut server = make_server();
-
+async fn do_handshake_except_last(client: &mut HandshakeProcessor<MockTLSAProvider>, server: &mut HandshakeProcessor<MockTLSAProvider>) -> Result<HandshakerResp, Status> {
     let c1 = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
             handshake_security_protocol: Alts as i32,
@@ -329,11 +345,21 @@ async fn test_handshake() {
     assert!(server_hello.hello.is_some());
     assert!(server_hello.key_exchange.is_some());
 
-    let c2 = client.step(Ok(HandshakerReq {
+    client.step(Ok(HandshakerReq {
         req_oneof: Some(Next(NextHandshakeMessageReq {
             in_bytes: s2.out_frames,
         })),
-    })).await.expect("second HandshakerResp from client");
+    })).await
+}
+
+#[tokio::test]
+async fn test_handshake() {
+    let mut client = make_client(MockTLSAProvider::Good);
+    let mut server = make_server(MockTLSAProvider::Good);
+
+    let c2 = do_handshake_except_last(&mut client, &mut server)
+        .await
+        .expect("second HandshakerResp from client");
     assert_eq!(c2.status, Some(HandshakerStatus::default()));
     let client_result = c2.result.as_ref().expect("Client should have finished");
     let client_kex = unframe_message(&c2).unwrap();
@@ -355,14 +381,29 @@ async fn test_handshake() {
 }
 
 #[tokio::test]
+async fn test_handshake_fails_on_tlsa_error() {
+    let mut client = make_client(MockTLSAProvider::Error);
+    let mut server = make_server(MockTLSAProvider::Error);
+
+    let c2 = do_handshake_except_last(&mut client, &mut server).await;
+
+    assert_eq!(c2
+        .expect_err("Client should have experienced TLSA fetch error")
+        .code(),
+        Code::Unavailable);
+}
+
+#[tokio::test]
 async fn test_rejects_certificate_outside_validity() {
     for clock_adjust_seconds in [-10000000, 0, 10000000] {
         let mut client = HandshakeProcessor::new(
             "test-client-user", test2_config().get(),
-            ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID+clock_adjust_seconds).expect("time"));
+            ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID+clock_adjust_seconds).expect("time"),
+            Arc::new(MockTLSAProvider::Good));
         let mut server = HandshakeProcessor::new(
             "test-server-user", test2_config().get(),
-            ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID+clock_adjust_seconds).expect("time"));
+            ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID+clock_adjust_seconds).expect("time"),
+            Arc::new(MockTLSAProvider::Good));
 
         let c1 = client.step(Ok(HandshakerReq {
             req_oneof: Some(ClientStart(StartClientHandshakeReq {

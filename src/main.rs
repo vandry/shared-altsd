@@ -12,6 +12,7 @@ mod config;
 mod exchange;
 mod server;
 mod setup;
+mod tlsa;
 #[cfg(test)]
 mod test;
 

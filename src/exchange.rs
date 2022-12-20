@@ -11,6 +11,7 @@ use tonic::{Code, Status};
 use x509_parser::{parse_x509_certificate, time::ASN1Time};
 
 use crate::config::CertAndKey;
+use crate::tlsa::{TLSAFuture, TLSAProvider, check_tlsa, tlsa_name};
 
 use crate::grpc::gcp::{RpcProtocolVersions, HandshakerResult};
 use crate::grpc::gcp::{Identity, identity::IdentityOneof};
@@ -29,7 +30,7 @@ pub fn record_protocol_supported(record_protocols: &Vec<String>) -> bool {
     record_protocols.iter().filter(|rp| *rp == SUPPORTED_RECORD_PROTOCOL).next().is_some()
 }
 
-pub struct Exchange {
+pub struct Exchange<T: TLSAProvider> {
     local_username: String,
     cert_and_key: Arc<CertAndKey>,
     client_random: [u8; RANDOM_SIZE],
@@ -39,11 +40,14 @@ pub struct Exchange {
     peer_cert_bytes: Option<Vec<u8>>,
     peer_public_key: Option<signature::UnparsedPublicKey<Vec<u8>>>,
     now: ASN1Time,
+    resolver: Arc<T>,
 
     // If empty, ignore.
     // If non-empty, fail the handshake if none match the remote identity.
     // TODO(vandry)
     target_identities: Vec<Identity>,
+
+    tlsa_future: Option<TLSAFuture>,
 
     // Stuff we do not care about but which must be relayed to the other side.
     // We carry it in SignedParams.
@@ -54,8 +58,8 @@ pub struct Exchange {
     peer_username: Option<String>,
 }
 
-impl Exchange {
-    pub fn new(local_username: &str, cert_and_key: Arc<CertAndKey>, now: ASN1Time) -> Self {
+impl<T: TLSAProvider> Exchange<T> {
+    pub fn new(local_username: &str, cert_and_key: Arc<CertAndKey>, now: ASN1Time, resolver: Arc<T>) -> Self {
         Self {
             local_username: String::from(local_username),
             cert_and_key,
@@ -70,7 +74,9 @@ impl Exchange {
             peer_rpc_versions: None,
             peer_username: None,
             target_identities: Vec::new(),
+            tlsa_future: None,
             now,
+            resolver,
         }
     }
 
@@ -122,6 +128,12 @@ impl Exchange {
         if self.now.gt(&validity.not_after) {
             return Err(Status::new(Code::Unauthenticated, "Certificate is expired"));
         }
+
+        let common_name = cert.subject().iter_common_name().next()
+            .ok_or_else(|| Status::unauthenticated("Peer certificate is missing common name"))?
+            .as_str()
+            .map_err(|_| Status::unauthenticated("Error extracting common name from peer certificate"))?;
+        self.tlsa_future = Some(self.resolver.clone().background_tlsa_lookup(tlsa_name(common_name)));
 
         self.peer_cert_bytes = Some(peer_cert_bytes);
 
@@ -227,7 +239,7 @@ impl Exchange {
         Ok(())
     }
 
-    pub fn result(&mut self) -> Result<Option<HandshakerResult>, Status> {
+    pub async fn result(&mut self) -> Result<Option<HandshakerResult>, Status> {
         Ok(match &self.ecdhe_shared {
             None => None,
             Some(shared_secret) => {
@@ -235,6 +247,7 @@ impl Exchange {
                 let mut okm = [0u8; SUPPORTED_RECORD_PROTOCOL_KEY_SIZE];
                 hkdf.expand(&[], &mut okm)
                     .map_err(|_| Status::new(Code::Internal, "Error extracting shared key"))?;
+                check_tlsa(self.tlsa_future.take().unwrap().await?)?;
                 Some(HandshakerResult {
                     application_protocol: self.application_protocols
                         .iter().next().or(Some(&String::new())).unwrap().to_string(),

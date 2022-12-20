@@ -13,6 +13,7 @@ use x509_parser::time::ASN1Time;
 
 use crate::config::{CertAndKey, Config};
 use crate::exchange::{Exchange, record_protocol_supported};
+use crate::tlsa::TLSAProvider;
 
 use crate::grpc::gcp::handshaker_service_server::HandshakerService;
 use crate::grpc::gcp::{HandshakerReq, HandshakerResp, HandshakerStatus};
@@ -57,18 +58,18 @@ enum HandshakeProcessorTalker {
     Server,
 }
 
-pub struct HandshakeProcessor {
+pub struct HandshakeProcessor<T: TLSAProvider> {
     available_bytes: Vec<u8>,
-    exchange: Exchange,
+    exchange: Exchange<T>,
     talker: HandshakeProcessorTalker,
     done_sending: bool,
 }
 
-impl HandshakeProcessor {
-    pub fn new(username: &str, cert_and_key: Arc<CertAndKey>, now: ASN1Time) -> Self {
+impl<T: TLSAProvider> HandshakeProcessor<T> {
+    pub fn new(username: &str, cert_and_key: Arc<CertAndKey>, now: ASN1Time, resolver: Arc<T>) -> Self {
         Self {
             available_bytes: Vec::new(),
-            exchange: Exchange::new(username, cert_and_key, now),
+            exchange: Exchange::new(username, cert_and_key, now, resolver),
             talker: HandshakeProcessorTalker::NotStarted,
             done_sending: false,
         }
@@ -208,7 +209,7 @@ impl HandshakeProcessor {
                 Some(o) => frame_message(o),
                 None => Vec::new(),
             },
-            result: self.exchange.result()?,
+            result: self.exchange.result().await?,
             status: Some(HandshakerStatus::default()),
         })
     }
@@ -232,18 +233,19 @@ impl HandshakeProcessor {
     }
 }
 
-pub struct Handshaker {
+pub struct Handshaker<T: TLSAProvider> {
     config: Config,
+    resolver: Arc<T>,
 }
 
-impl Handshaker {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+impl<T: TLSAProvider> Handshaker<T> {
+    pub fn new(config: Config, resolver: Arc<T>) -> Self {
+        Self { config, resolver }
     }
 }
 
 #[tonic::async_trait]
-impl HandshakerService for Handshaker {
+impl<T: TLSAProvider> HandshakerService for Handshaker<T> {
     type DoHandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakerResp, Status>> + Send>>;
 
     async fn do_handshake(
@@ -261,7 +263,7 @@ impl HandshakerService for Handshaker {
                 return Err(Status::new(Code::Unauthenticated, "Peer uid corresponds to no user"));
             }
         };
-        let p = HandshakeProcessor::new(&username, self.config.get(), ASN1Time::now());
+        let p = HandshakeProcessor::new(&username, self.config.get(), ASN1Time::now(), self.resolver.clone());
         Ok(Response::new(Box::pin(p.run(req.into_inner()))))
     }
 }
