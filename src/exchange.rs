@@ -38,6 +38,7 @@ pub struct Exchange<T: TLSAProvider> {
     ecdhe_secret: EphemeralSecret,
     ecdhe_shared: Option<SharedSecret>,
     peer_cert_bytes: Option<Vec<u8>>,
+    peer_public_key_bytes: Option<Vec<u8>>,
     peer_public_key: Option<signature::UnparsedPublicKey<Vec<u8>>>,
     now: ASN1Time,
     resolver: Arc<T>,
@@ -69,6 +70,7 @@ impl<T: TLSAProvider> Exchange<T> {
             ecdhe_shared: None,
             peer_cert_bytes: None,
             peer_public_key: None,
+            peer_public_key_bytes: None,
             application_protocols: Vec::new(),
             rpc_versions: None,
             peer_rpc_versions: None,
@@ -120,6 +122,7 @@ impl<T: TLSAProvider> Exchange<T> {
         }?;
         self.peer_public_key = Some(signature::UnparsedPublicKey::new(
             &signature::RSA_PKCS1_2048_8192_SHA256, cert.public_key().subject_public_key.data.to_vec()));
+        self.peer_public_key_bytes = Some(cert.public_key().raw.to_vec());
 
         let validity = cert.validity();
         if self.now.lt(&validity.not_before) {
@@ -247,7 +250,9 @@ impl<T: TLSAProvider> Exchange<T> {
                 let mut okm = [0u8; SUPPORTED_RECORD_PROTOCOL_KEY_SIZE];
                 hkdf.expand(&[], &mut okm)
                     .map_err(|_| Status::new(Code::Internal, "Error extracting shared key"))?;
-                check_tlsa(self.tlsa_future.take().unwrap().await?)?;
+                check_tlsa(&self.tlsa_future.take().unwrap().await?,
+                           &self.peer_cert_bytes.as_ref().unwrap_or(&vec![]),
+                           &self.peer_public_key_bytes.as_ref().unwrap_or(&vec![]))?;
                 Some(HandshakerResult {
                     application_protocol: self.application_protocols
                         .iter().next().or(Some(&String::new())).unwrap().to_string(),

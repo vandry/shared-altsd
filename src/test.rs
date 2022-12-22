@@ -1,14 +1,16 @@
 use futures::future::ready;
+use hex_literal::hex;
 use prost::Message;
 use std::collections::HashMap;
 use std::io::{BufRead, Cursor};
 use std::sync::Arc;
 use tonic::{Code, Status};
-use x509_parser::time::ASN1Time;
+use trust_dns_proto::rr::rdata::tlsa::{CertUsage, Matching, Selector, TLSA};
+use x509_parser::{parse_x509_certificate, time::ASN1Time};
 
 use crate::config::Config;
 use crate::server::HandshakeProcessor;
-use crate::tlsa::{TLSAFuture, TLSAProvider};
+use crate::tlsa::{TLSAFuture, TLSAProvider, check_tlsa};
 
 use crate::grpc::gcp::{HandshakerReq, NextHandshakeMessageReq, StartClientHandshakeReq, StartServerHandshakeReq};
 use crate::grpc::gcp::{HandshakerResp, HandshakerStatus, ServerHandshakeParameters};
@@ -105,6 +107,22 @@ DyPpEZYr0p6psZFOg3/b4OeEjguA
     ").expect("valid key and cert")
 }
 
+fn test1_valid_tlsas() -> Vec<TLSA> {
+    vec![
+        TLSA::new(CertUsage::DomainIssued, Selector::Full, Matching::Sha256,
+                  hex!("ef88a99949d171997fd2fdb02a0acba75eb85a9ae0dfdb7b0f670ac247d2ad6e").to_vec()),
+        TLSA::new(CertUsage::DomainIssued, Selector::Full, Matching::Sha512,
+                  hex!("da26072e33d0490e0b1f44262e4813708
+                        d5bdbbbbe3f544273dc7b40f278c9d8dc
+                        111bd30dcda9d1073cbac63640b736398
+                        29ae62477a5a255144451c76b2534").to_vec()),
+        TLSA::new(CertUsage::DomainIssued, Selector::Full, Matching::Raw,
+                  test1_config().get().cert_bytes.clone()),
+        TLSA::new(CertUsage::DomainIssued, Selector::Spki, Matching::Sha256,
+                  hex!("43e1c7ae849bbd3426436aff451de0132a88b12a8fae07ba8c7e46f38b1f6a0a").to_vec()),
+    ]
+}
+
 fn test2_config() -> Config {
     Config::new_from_string("
 -----BEGIN CERTIFICATE-----
@@ -192,15 +210,31 @@ SPOKGkn7sXYozFvSfYngf+gO2OgZ1ofN
     ").expect("valid key and cert")
 }
 
+fn test2_valid_tlsas() -> Vec<TLSA> {
+    vec![
+        TLSA::new(CertUsage::DomainIssued, Selector::Full, Matching::Sha256,
+                  hex!("c58d1e48682eeb14eb3bb9b4cc47f667713cd10ef3e7756a03ec1be743d0ce13").to_vec()),
+        TLSA::new(CertUsage::DomainIssued, Selector::Spki, Matching::Sha256,
+                  hex!("594677314cd904e97b90fbcad5b2988ca567ea3d16f9cf60d4574bce859ae8f0").to_vec()),
+    ]
+}
+
 enum MockTLSAProvider {
-    Good,
+    GoodFull,
+    GoodSpki,
     Error,
 }
 
 impl TLSAProvider for MockTLSAProvider {
-    fn background_tlsa_lookup(self: Arc<Self>, _name: String) -> TLSAFuture {
+    fn background_tlsa_lookup(self: Arc<Self>, name: String) -> TLSAFuture {
+        let tlsas = match name.as_str() {
+            "_shared-alts.test1.domain." => test1_valid_tlsas(),
+            "_shared-alts.test2.domain." => test2_valid_tlsas(),
+            _ => vec![],
+        };
         let result = match *self {
-            MockTLSAProvider::Good => Ok(Vec::new()),
+            MockTLSAProvider::GoodFull => Ok(tlsas.into_iter().filter(|t| t.selector() == Selector::Full).collect()),
+            MockTLSAProvider::GoodSpki => Ok(tlsas.into_iter().filter(|t| t.selector() == Selector::Spki).collect()),
             MockTLSAProvider::Error => Err(Status::unavailable("oops")),
         };
         Box::pin(ready(result))
@@ -239,7 +273,7 @@ fn unframe_message(r: &HandshakerResp) -> Option<AltsMessage> {
 
 #[tokio::test]
 async fn test_client_rejects_wrong_handshake_protocol() {
-    let mut client = make_client(MockTLSAProvider::Good);
+    let mut client = make_client(MockTLSAProvider::GoodFull);
 
     let status = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
@@ -253,7 +287,7 @@ async fn test_client_rejects_wrong_handshake_protocol() {
 
 #[tokio::test]
 async fn test_server_rejects_wrong_handshake_protocol() {
-    let mut server = make_server(MockTLSAProvider::Good);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
 
     let status = server.step(Ok(HandshakerReq {
         req_oneof: Some(ServerStart(StartServerHandshakeReq {
@@ -269,7 +303,7 @@ async fn test_server_rejects_wrong_handshake_protocol() {
 
 #[tokio::test]
 async fn test_client_rejects_wrong_record_protocol() {
-    let mut client = make_client(MockTLSAProvider::Good);
+    let mut client = make_client(MockTLSAProvider::GoodFull);
 
     let status = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
@@ -283,7 +317,7 @@ async fn test_client_rejects_wrong_record_protocol() {
 
 #[tokio::test]
 async fn test_server_rejects_wrong_record_protocol() {
-    let mut server = make_server(MockTLSAProvider::Good);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
 
     let status = server.step(Ok(HandshakerReq {
         req_oneof: Some(ServerStart(StartServerHandshakeReq {
@@ -352,12 +386,8 @@ async fn do_handshake_except_last(client: &mut HandshakeProcessor<MockTLSAProvid
     })).await
 }
 
-#[tokio::test]
-async fn test_handshake() {
-    let mut client = make_client(MockTLSAProvider::Good);
-    let mut server = make_server(MockTLSAProvider::Good);
-
-    let c2 = do_handshake_except_last(&mut client, &mut server)
+async fn do_handshake(client: &mut HandshakeProcessor<MockTLSAProvider>, server: &mut HandshakeProcessor<MockTLSAProvider>) {
+    let c2 = do_handshake_except_last(client, server)
         .await
         .expect("second HandshakerResp from client");
     assert_eq!(c2.status, Some(HandshakerStatus::default()));
@@ -381,6 +411,20 @@ async fn test_handshake() {
 }
 
 #[tokio::test]
+async fn test_handshake_with_full_tlsa() {
+    let mut client = make_client(MockTLSAProvider::GoodFull);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
+    do_handshake(&mut client, &mut server).await
+}
+
+#[tokio::test]
+async fn test_handshake_with_spki_tlsa() {
+    let mut client = make_client(MockTLSAProvider::GoodSpki);
+    let mut server = make_server(MockTLSAProvider::GoodSpki);
+    do_handshake(&mut client, &mut server).await
+}
+
+#[tokio::test]
 async fn test_handshake_fails_on_tlsa_error() {
     let mut client = make_client(MockTLSAProvider::Error);
     let mut server = make_server(MockTLSAProvider::Error);
@@ -399,11 +443,11 @@ async fn test_rejects_certificate_outside_validity() {
         let mut client = HandshakeProcessor::new(
             "test-client-user", test2_config().get(),
             ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID+clock_adjust_seconds).expect("time"),
-            Arc::new(MockTLSAProvider::Good));
+            Arc::new(MockTLSAProvider::GoodFull));
         let mut server = HandshakeProcessor::new(
             "test-server-user", test2_config().get(),
             ASN1Time::from_timestamp(TIME_WHEN_CERT_IS_VALID+clock_adjust_seconds).expect("time"),
-            Arc::new(MockTLSAProvider::Good));
+            Arc::new(MockTLSAProvider::GoodFull));
 
         let c1 = client.step(Ok(HandshakerReq {
             req_oneof: Some(ClientStart(StartClientHandshakeReq {
@@ -433,6 +477,35 @@ async fn test_rejects_certificate_outside_validity() {
                 Code::Unauthenticated);
         }
     }
+}
+
+fn get_cert_public_key(cert_bytes: &[u8]) -> Vec<u8> {
+    let (_rem, cert) = parse_x509_certificate(cert_bytes).expect("parseable cert");
+    cert.public_key().raw.to_vec()
+}
+
+#[tokio::test]
+async fn test_accepts_valid_tlsas() {
+    let cert_bytes = &test1_config().get().cert_bytes;
+    let pk_bytes = get_cert_public_key(cert_bytes);
+    for record in test1_valid_tlsas() {
+        let test_tlsas = vec![record];
+        check_tlsa(&test_tlsas, cert_bytes, &pk_bytes)
+            .map_err(|e| format!("Validating {:?}: {}", &test_tlsas, e))
+            .expect("Validation success");
+    }
+}
+
+#[tokio::test]
+async fn test_accepts_wrong_tlsa_followed_by_valid_one() {
+    let cert_bytes = &test1_config().get().cert_bytes;
+    let pk_bytes = get_cert_public_key(cert_bytes);
+    let good = test1_valid_tlsas().into_iter().next().unwrap();
+    let bad = test2_valid_tlsas().into_iter().next().unwrap();
+    let test_tlsas = vec![bad, good];
+    check_tlsa(&test_tlsas, cert_bytes, &pk_bytes)
+        .map_err(|e| format!("Validating {:?}: {}", &test_tlsas, e))
+        .expect("Validation success");
 }
 
 // TODO(vandry): Test that delivering wrong or duplicated messages.

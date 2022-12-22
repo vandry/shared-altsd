@@ -27,5 +27,8 @@ trust-dns-resolver = { version = "0.22.0", features = ["dnssec-ring"] }
 users = "0.11"
 x509-parser = "0.14.0"
 
+[dev-dependencies]
+hex-literal = "0.3.4"
+
 [build-dependencies]
 tonic-build = "0.8"
