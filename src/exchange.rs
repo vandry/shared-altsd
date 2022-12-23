@@ -40,12 +40,12 @@ pub struct Exchange<T: TLSAProvider> {
     peer_cert_bytes: Option<Vec<u8>>,
     peer_public_key_bytes: Option<Vec<u8>>,
     peer_public_key: Option<signature::UnparsedPublicKey<Vec<u8>>>,
+    peer_common_name: Option<String>,
     now: ASN1Time,
     resolver: Arc<T>,
 
     // If empty, ignore.
     // If non-empty, fail the handshake if none match the remote identity.
-    // TODO(vandry)
     target_identities: Vec<Identity>,
 
     tlsa_future: Option<TLSAFuture>,
@@ -71,6 +71,7 @@ impl<T: TLSAProvider> Exchange<T> {
             peer_cert_bytes: None,
             peer_public_key: None,
             peer_public_key_bytes: None,
+            peer_common_name: None,
             application_protocols: Vec::new(),
             rpc_versions: None,
             peer_rpc_versions: None,
@@ -136,6 +137,7 @@ impl<T: TLSAProvider> Exchange<T> {
             .ok_or_else(|| Status::unauthenticated("Peer certificate is missing common name"))?
             .as_str()
             .map_err(|_| Status::unauthenticated("Error extracting common name from peer certificate"))?;
+        self.peer_common_name = Some(common_name.to_string());
         self.tlsa_future = Some(self.resolver.clone().background_tlsa_lookup(tlsa_name(common_name)));
 
         self.peer_cert_bytes = Some(peer_cert_bytes);
@@ -246,6 +248,22 @@ impl<T: TLSAProvider> Exchange<T> {
         Ok(match &self.ecdhe_shared {
             None => None,
             Some(shared_secret) => {
+                let peer_username = self.peer_username.as_ref()
+                    .ok_or_else(|| Status::unauthenticated("missing remote username"))?;
+                let peer_hostname = self.peer_common_name.as_ref()
+                    .ok_or_else(|| Status::unauthenticated("missing remote common name"))?;
+                let peer_identity = format!("{}@{}", peer_username, peer_hostname);
+
+                // Zero target_identities means all peer identities are acceptable.
+                if self.target_identities.len() > 0 {
+                    self.target_identities.iter()
+                        .find(|i| match &i.identity_oneof {
+                            Some(IdentityOneof::ServiceAccount(requested_identity)) => *requested_identity == peer_identity,
+                            _ => false,
+                        })
+                        .ok_or_else(|| Status::unauthenticated(format!("Remote identity {} not among requested remte identities", peer_identity)))?;
+                }
+
                 let hkdf = shared_secret.extract::<Sha256>(None);
                 let mut okm = [0u8; SUPPORTED_RECORD_PROTOCOL_KEY_SIZE];
                 hkdf.expand(&[], &mut okm)
@@ -258,14 +276,9 @@ impl<T: TLSAProvider> Exchange<T> {
                         .iter().next().or(Some(&String::new())).unwrap().to_string(),
                     record_protocol: String::from(SUPPORTED_RECORD_PROTOCOL),
                     key_data: okm.to_vec(),
-                    peer_identity: match &self.peer_username {
-                        Some(peer_username) => Some(Identity {
-                            identity_oneof: Some(IdentityOneof::ServiceAccount(
-                                format!("{}@unverified.TODO", peer_username)  // TODO(vandry): Verify remote cert
-                            )),
-                        }),
-                        None => None,
-                    },
+                    peer_identity: Some(Identity {
+                        identity_oneof: Some(IdentityOneof::ServiceAccount(peer_identity)),
+                    }),
                     local_identity: Some(Identity {
                         identity_oneof: Some(IdentityOneof::ServiceAccount(
                             format!("{}@{}", self.local_username, self.cert_and_key.common_name)

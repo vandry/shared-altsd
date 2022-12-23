@@ -16,6 +16,7 @@ use crate::grpc::gcp::{HandshakerReq, NextHandshakeMessageReq, StartClientHandsh
 use crate::grpc::gcp::{HandshakerResp, HandshakerStatus, ServerHandshakeParameters};
 use crate::grpc::gcp::handshaker_req::ReqOneof::{ClientStart, ServerStart, Next};
 use crate::grpc::gcp::HandshakeProtocol::{Alts, Tls};
+use crate::grpc::gcp::{Identity, identity::IdentityOneof};
 use crate::shared_alts_pb::AltsMessage;
 
 const TIME_WHEN_CERT_IS_VALID: i64 = 1671478511;
@@ -331,7 +332,7 @@ async fn test_server_rejects_wrong_record_protocol() {
     assert!(status.message().contains("record_protocol"));
 }
 
-async fn do_handshake_except_last(client: &mut HandshakeProcessor<MockTLSAProvider>, server: &mut HandshakeProcessor<MockTLSAProvider>) -> Result<HandshakerResp, Status> {
+async fn do_handshake_except_last(client: &mut HandshakeProcessor<MockTLSAProvider>, server: &mut HandshakeProcessor<MockTLSAProvider>, client_target_identities: Vec<Identity>) -> Result<HandshakerResp, Status> {
     let c1 = client.step(Ok(HandshakerReq {
         req_oneof: Some(ClientStart(StartClientHandshakeReq {
             handshake_security_protocol: Alts as i32,
@@ -340,6 +341,7 @@ async fn do_handshake_except_last(client: &mut HandshakeProcessor<MockTLSAProvid
                 String::from("fancy"),
             ],
             record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
+            target_identities: client_target_identities,
             // rpc_versions:
             ..StartClientHandshakeReq::default()
         })),
@@ -386,8 +388,8 @@ async fn do_handshake_except_last(client: &mut HandshakeProcessor<MockTLSAProvid
     })).await
 }
 
-async fn do_handshake(client: &mut HandshakeProcessor<MockTLSAProvider>, server: &mut HandshakeProcessor<MockTLSAProvider>) {
-    let c2 = do_handshake_except_last(client, server)
+async fn do_handshake(client: &mut HandshakeProcessor<MockTLSAProvider>, server: &mut HandshakeProcessor<MockTLSAProvider>, client_target_identities: Vec<Identity>) {
+    let c2 = do_handshake_except_last(client, server, client_target_identities)
         .await
         .expect("second HandshakerResp from client");
     assert_eq!(c2.status, Some(HandshakerStatus::default()));
@@ -405,8 +407,19 @@ async fn do_handshake(client: &mut HandshakeProcessor<MockTLSAProvider>, server:
     let server_result = s3.result.as_ref().expect("Server should have finished");
     assert_eq!(unframe_message(&s3), None);
 
+    let expected_client_identity = Some(Identity {
+        identity_oneof: Some(IdentityOneof::ServiceAccount(String::from("test-client-user@test1.domain"))),
+    });
+    let expected_server_identity = Some(Identity {
+        identity_oneof: Some(IdentityOneof::ServiceAccount(String::from("test-server-user@test2.domain"))),
+    });
+
     assert_eq!(client_result.application_protocol, "fancy");
     assert_eq!(server_result.application_protocol, "fancy");
+    assert_eq!(client_result.local_identity, expected_client_identity);
+    assert_eq!(client_result.peer_identity, expected_server_identity);
+    assert_eq!(server_result.local_identity, expected_server_identity);
+    assert_eq!(server_result.peer_identity, expected_client_identity);
     assert_eq!(client_result.key_data, server_result.key_data);
 }
 
@@ -414,14 +427,45 @@ async fn do_handshake(client: &mut HandshakeProcessor<MockTLSAProvider>, server:
 async fn test_handshake_with_full_tlsa() {
     let mut client = make_client(MockTLSAProvider::GoodFull);
     let mut server = make_server(MockTLSAProvider::GoodFull);
-    do_handshake(&mut client, &mut server).await
+    do_handshake(&mut client, &mut server, Vec::new()).await
 }
 
 #[tokio::test]
 async fn test_handshake_with_spki_tlsa() {
     let mut client = make_client(MockTLSAProvider::GoodSpki);
     let mut server = make_server(MockTLSAProvider::GoodSpki);
-    do_handshake(&mut client, &mut server).await
+    do_handshake(&mut client, &mut server, Vec::new()).await
+}
+
+#[tokio::test]
+async fn test_handshake_with_target_identities() {
+    let mut client = make_client(MockTLSAProvider::GoodFull);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
+    do_handshake(&mut client, &mut server, vec![
+        Identity {
+            identity_oneof: Some(IdentityOneof::ServiceAccount(String::from("unrelated@nowhere"))),
+        },
+        Identity {
+            identity_oneof: Some(IdentityOneof::ServiceAccount(String::from("test-server-user@test2.domain"))),
+        },
+    ]).await
+}
+
+#[tokio::test]
+async fn test_handshake_fails_with_wrong_remote_identity() {
+    let mut client = make_client(MockTLSAProvider::GoodFull);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
+
+    let c2 = do_handshake_except_last(&mut client, &mut server, vec![
+        Identity {
+            identity_oneof: Some(IdentityOneof::ServiceAccount(String::from("unrelated@nowhere"))),
+        },
+    ]).await;
+
+    assert_eq!(c2
+        .expect_err("Client should have rejected the remote identity")
+        .code(),
+        Code::Unauthenticated);
 }
 
 #[tokio::test]
@@ -429,7 +473,7 @@ async fn test_handshake_fails_on_tlsa_error() {
     let mut client = make_client(MockTLSAProvider::Error);
     let mut server = make_server(MockTLSAProvider::Error);
 
-    let c2 = do_handshake_except_last(&mut client, &mut server).await;
+    let c2 = do_handshake_except_last(&mut client, &mut server, Vec::new()).await;
 
     assert_eq!(c2
         .expect_err("Client should have experienced TLSA fetch error")
