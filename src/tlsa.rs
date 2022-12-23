@@ -12,7 +12,7 @@ pub trait TLSAProvider: Send + Sync + 'static {
 }
 
 pub fn tlsa_name(common_name: &str) -> String {
-    format!("_shared-alts.{}{}", common_name, if common_name.ends_with(".") { "" } else { "." })
+    format!("_shared-alts.{}{}", common_name, if common_name.ends_with('.') { "" } else { "." })
 }
 
 pub fn check_tlsa(records: &Vec<TLSA>, cert: &[u8], public_key: &[u8]) -> Result<(), Status> {

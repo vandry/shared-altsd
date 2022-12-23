@@ -1,5 +1,4 @@
 use futures::TryFutureExt;
-use log;
 use std::env;
 use std::io::ErrorKind;
 use std::sync::Arc;

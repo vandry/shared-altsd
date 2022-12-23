@@ -1,6 +1,5 @@
 use async_stream::stream;
 use futures::Stream;
-use log;
 use prost::Message;
 use std::io::{BufRead, Cursor};
 use std::pin::Pin;

@@ -1,7 +1,6 @@
 use k256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret, ecdh::SharedSecret};
 use rand_core::{RngCore, OsRng};
 use ring::{rand, signature};
-use log;
 use prost::Message;
 use sha2::Sha256;
 use std::collections::HashSet;
@@ -26,8 +25,8 @@ const RANDOM_SIZE: usize = 32;
 const SUPPORTED_RECORD_PROTOCOL: &str = "ALTSRP_GCM_AES128_REKEY";
 const SUPPORTED_RECORD_PROTOCOL_KEY_SIZE: usize = 44;
 
-pub fn record_protocol_supported(record_protocols: &Vec<String>) -> bool {
-    record_protocols.iter().filter(|rp| *rp == SUPPORTED_RECORD_PROTOCOL).next().is_some()
+pub fn record_protocol_supported(record_protocols: &[String]) -> bool {
+    record_protocols.iter().any(|rp| *rp == SUPPORTED_RECORD_PROTOCOL)
 }
 
 pub struct Exchange<T: TLSAProvider> {
@@ -205,7 +204,7 @@ impl<T: TLSAProvider> Exchange<T> {
     }
 
     pub fn accept_key_exchange(&mut self, kex: KeyExchange) -> Result<(), Status> {
-        let signed_params_bytes = kex.signed_params.or(Some(vec![])).unwrap();
+        let signed_params_bytes = kex.signed_params.unwrap_or_default();
         let signed_payload = [
             self.client_random.to_vec(),
             self.server_random.to_vec(),
@@ -214,7 +213,7 @@ impl<T: TLSAProvider> Exchange<T> {
 
         let peer_public_key = self.peer_public_key.as_ref()
             .ok_or_else(|| Status::new(Code::Internal, "KeyExchange with unknown peer public key (was a Hello sent first?)"))?;
-        peer_public_key.verify(&signed_payload, &kex.signature.or(Some(vec![])).unwrap())
+        peer_public_key.verify(&signed_payload, &kex.signature.unwrap_or_default())
             .map_err(|_| Status::new(Code::Unauthenticated, "Signature verification failed"))?;
 
         let signed_params = SignedParams::decode(Cursor::new(signed_params_bytes))
@@ -255,7 +254,7 @@ impl<T: TLSAProvider> Exchange<T> {
                 let peer_identity = format!("{}@{}", peer_username, peer_hostname);
 
                 // Zero target_identities means all peer identities are acceptable.
-                if self.target_identities.len() > 0 {
+                if !self.target_identities.is_empty() {
                     self.target_identities.iter()
                         .find(|i| match &i.identity_oneof {
                             Some(IdentityOneof::ServiceAccount(requested_identity)) => *requested_identity == peer_identity,
@@ -269,11 +268,11 @@ impl<T: TLSAProvider> Exchange<T> {
                 hkdf.expand(&[], &mut okm)
                     .map_err(|_| Status::new(Code::Internal, "Error extracting shared key"))?;
                 check_tlsa(&self.tlsa_future.take().unwrap().await?,
-                           &self.peer_cert_bytes.as_ref().unwrap_or(&vec![]),
-                           &self.peer_public_key_bytes.as_ref().unwrap_or(&vec![]))?;
+                           self.peer_cert_bytes.as_ref().unwrap_or(&vec![]),
+                           self.peer_public_key_bytes.as_ref().unwrap_or(&vec![]))?;
                 Some(HandshakerResult {
                     application_protocol: self.application_protocols
-                        .iter().next().or(Some(&String::new())).unwrap().to_string(),
+                        .get(0).unwrap_or(&String::new()).to_string(),
                     record_protocol: String::from(SUPPORTED_RECORD_PROTOCOL),
                     key_data: okm.to_vec(),
                     peer_identity: Some(Identity {

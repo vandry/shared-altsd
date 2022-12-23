@@ -60,9 +60,9 @@ fn read_certificate_and_key(mut reader: &mut dyn BufRead) -> Result<CertAndKey, 
         }
     }
     let key = maybe_key
-        .ok_or_else(|| CertAndKeyReadError::MissingKey)?
+        .ok_or(CertAndKeyReadError::MissingKey)?
         .map_err(CertAndKeyReadError::BadKey)?;
-    let cert_bytes = maybe_cert_bytes.ok_or_else(|| CertAndKeyReadError::MissingCert)?;
+    let cert_bytes = maybe_cert_bytes.ok_or(CertAndKeyReadError::MissingCert)?;
     let cert = match parse_x509_certificate(&cert_bytes) {
         Ok((_rem, x509)) => x509,
         Err(e) => {
@@ -84,14 +84,14 @@ fn read_certificate_and_key(mut reader: &mut dyn BufRead) -> Result<CertAndKey, 
         return Err(CertAndKeyReadError::CertAndKeyMismatch);
     }
     let common_name = cert.subject().iter_common_name().next()
-        .ok_or_else(|| CertAndKeyReadError::MissingCommonName)?
+        .ok_or(CertAndKeyReadError::MissingCommonName)?
         .as_str()
         .map_err(|_| CertAndKeyReadError::MissingCommonName)?
         .to_string();
     Ok(CertAndKey {
-        cert_bytes: cert_bytes,
-        common_name: common_name,
-        key: key,
+        cert_bytes,
+        common_name,
+        key,
     })
 }
 
