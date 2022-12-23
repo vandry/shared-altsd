@@ -1,6 +1,7 @@
 use futures::TryFutureExt;
 use std::env;
 use std::io::ErrorKind;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -40,9 +41,14 @@ impl TLSAProvider for TokioAsyncResolver {
 }
 
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let socket_path = &args[1];
-    let config = Config::new_from_file(std::path::Path::new(&args[2]))?;
+    let args: Vec<_> = env::args_os().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: {} listen-uds-socket-path certificate_and_key.pem",
+                  args[0].to_string_lossy());
+        std::process::exit(3);
+    }
+    let socket_path = Path::new(&args[1]);
+    let config = Config::new_from_file(Path::new(&args[2]))?;
 
     let (resolver_config, mut resolver_opts) = read_system_conf()?;
     resolver_opts.validate = true;  // DNSSEC is essential
@@ -64,7 +70,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Check if this is a stale socket.
             match tokio::net::UnixStream::connect(socket_path).await {
                 Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-                    log::warn!("Cleaning up stale socket {}", socket_path);
+                    log::warn!("Cleaning up stale socket {}", socket_path.to_string_lossy());
                     std::fs::remove_file(socket_path)?;
                     // Try again.
                     UnixListener::bind(socket_path)
@@ -74,7 +80,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => Err(e)
     }?;
-    log::info!("Listening on {}", socket_path);
+    log::info!("Listening on {}", socket_path.to_string_lossy());
     let listener_stream = UnixListenerStream::new(listener);
 
     Server::builder()
