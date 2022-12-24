@@ -203,6 +203,12 @@ impl<T: TLSAProvider> Exchange<T> {
     }
 
     pub fn accept_key_exchange(&mut self, kex: KeyExchange) -> Result<(), Status> {
+        if self.ecdhe_shared.is_some() {
+            return Err(Status::new(
+                Code::InvalidArgument,
+                "Got duplicate KeyExchange message",
+            ));
+        }
         let signed_params_bytes = kex.signed_params.unwrap_or_default();
         let signed_payload = [
             self.client_random.to_vec(),

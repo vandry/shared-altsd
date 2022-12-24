@@ -552,4 +552,177 @@ async fn test_accepts_wrong_tlsa_followed_by_valid_one() {
         .expect("Validation success");
 }
 
-// TODO(vandry): Test that delivering wrong or duplicated messages.
+#[tokio::test]
+async fn test_server_rejects_duplicate_hello() {
+    let mut client = make_client(MockTLSAProvider::GoodFull);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
+
+    let c1 = client
+        .step(Ok(HandshakerReq {
+            req_oneof: Some(ClientStart(StartClientHandshakeReq {
+                handshake_security_protocol: Alts as i32,
+                record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
+                ..StartClientHandshakeReq::default()
+            })),
+        }))
+        .await
+        .expect("first HandshakerResp from client");
+
+    server
+        .step(Ok(HandshakerReq {
+            req_oneof: Some(ServerStart(StartServerHandshakeReq {
+                handshake_parameters: HashMap::from([(
+                    Alts as i32,
+                    ServerHandshakeParameters {
+                        record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
+                        ..ServerHandshakeParameters::default()
+                    },
+                )]),
+                in_bytes: c1.out_frames.clone(),
+                ..StartServerHandshakeReq::default()
+            })),
+        }))
+        .await
+        .expect("first HandshakerResp from server");
+
+    // Feed it the same Hello again.
+    assert!(server
+        .step(Ok(HandshakerReq {
+            req_oneof: Some(Next(NextHandshakeMessageReq {
+                in_bytes: c1.out_frames,
+            })),
+        }))
+        .await
+        .expect_err("server should rejet duplicate hello")
+        .message()
+        .contains("duplicate"));
+}
+
+async fn do_hello_hello_kex(
+    client: &mut HandshakeProcessor<MockTLSAProvider>,
+    server: &mut HandshakeProcessor<MockTLSAProvider>,
+) -> HandshakerResp {
+    let c1 = client
+        .step(Ok(HandshakerReq {
+            req_oneof: Some(ClientStart(StartClientHandshakeReq {
+                handshake_security_protocol: Alts as i32,
+                record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
+                ..StartClientHandshakeReq::default()
+            })),
+        }))
+        .await
+        .expect("first HandshakerResp from client");
+
+    let s1 = server
+        .step(Ok(HandshakerReq {
+            req_oneof: Some(ServerStart(StartServerHandshakeReq {
+                handshake_parameters: HashMap::from([(
+                    Alts as i32,
+                    ServerHandshakeParameters {
+                        record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
+                        ..ServerHandshakeParameters::default()
+                    },
+                )]),
+                in_bytes: c1.out_frames.clone(),
+                ..StartServerHandshakeReq::default()
+            })),
+        }))
+        .await
+        .expect("first HandshakerResp from server");
+
+    client
+        .step(Ok(HandshakerReq {
+            req_oneof: Some(Next(NextHandshakeMessageReq {
+                in_bytes: s1.out_frames.clone(),
+            })),
+        }))
+        .await
+        .expect("client accepts first response from server");
+
+    s1
+}
+
+#[tokio::test]
+async fn test_client_rejects_duplicate_hello() {
+    let mut client = make_client(MockTLSAProvider::GoodFull);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
+
+    let server_message = do_hello_hello_kex(&mut client, &mut server).await;
+
+    // Feed the client the same message again
+    assert_eq!(
+        client
+            .step(Ok(HandshakerReq {
+                req_oneof: Some(Next(NextHandshakeMessageReq {
+                    in_bytes: server_message.out_frames,
+                })),
+            }))
+            .await
+            .expect_err("client rejects same first response from server")
+            .message(),
+        "Got duplicate Hello message"
+    );
+}
+
+#[tokio::test]
+async fn test_client_rejects_duplicate_kex() {
+    let mut client = make_client(MockTLSAProvider::GoodFull);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
+
+    let server_message = do_hello_hello_kex(&mut client, &mut server).await;
+
+    let mut server_hello_kex = unframe_message(&server_message).unwrap();
+    server_hello_kex.hello = None;
+
+    let mut buf = Vec::new();
+    buf.reserve(server_hello_kex.encoded_len());
+    server_hello_kex.encode(&mut buf).unwrap();
+    let len = buf.len() as u32;
+    let server_kex_without_hello = [len.to_be_bytes().to_vec(), buf].concat();
+
+    // Feed the client the same message but without hello
+    assert_eq!(
+        client
+            .step(Ok(HandshakerReq {
+                req_oneof: Some(Next(NextHandshakeMessageReq {
+                    in_bytes: server_kex_without_hello,
+                })),
+            }))
+            .await
+            .expect_err("client rejects second kex from server")
+            .message(),
+        "Got duplicate KeyExchange message"
+    );
+}
+
+#[tokio::test]
+async fn test_server_rejects_duplicate_kex() {
+    let mut client = make_client(MockTLSAProvider::GoodFull);
+    let mut server = make_server(MockTLSAProvider::GoodFull);
+
+    let c2 = do_handshake_except_last(&mut client, &mut server, Vec::new())
+        .await
+        .expect("second HandshakerResp from client");
+
+    server
+        .step(Ok(HandshakerReq {
+            req_oneof: Some(Next(NextHandshakeMessageReq {
+                in_bytes: c2.out_frames.clone(),
+            })),
+        }))
+        .await
+        .expect("third HandshakerResp from server");
+
+    assert_eq!(
+        server
+            .step(Ok(HandshakerReq {
+                req_oneof: Some(Next(NextHandshakeMessageReq {
+                    in_bytes: c2.out_frames,
+                })),
+            }))
+            .await
+            .expect_err("server rejects second kex from client")
+            .message(),
+        "Got duplicate KeyExchange message"
+    );
+}

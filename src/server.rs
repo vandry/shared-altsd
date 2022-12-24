@@ -62,7 +62,6 @@ pub struct HandshakeProcessor<T: TLSAProvider> {
     available_bytes: Vec<u8>,
     exchange: Exchange<T>,
     talker: HandshakeProcessorTalker,
-    done_sending: bool,
 }
 
 impl<T: TLSAProvider> HandshakeProcessor<T> {
@@ -71,7 +70,6 @@ impl<T: TLSAProvider> HandshakeProcessor<T> {
             available_bytes: Vec::new(),
             exchange: Exchange::new(username, cert_and_key, now, resolver),
             talker: HandshakeProcessorTalker::NotStarted,
-            done_sending: false,
         }
     }
 
@@ -205,10 +203,6 @@ impl<T: TLSAProvider> HandshakeProcessor<T> {
                     }?;
                     match feed_out {
                         Some(o) => {
-                            if self.done_sending {
-                                return Err(Status::new(Code::InvalidArgument, "Protocol is repeating"));
-                            }
-                            self.done_sending = true;
                             output = Some(o);
                         }
                         None => (),
