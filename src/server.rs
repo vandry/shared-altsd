@@ -18,6 +18,7 @@ use crate::grpc::gcp::handshaker_service_server::HandshakerService;
 use crate::grpc::gcp::{HandshakerReq, HandshakerResp, HandshakerStatus};
 use crate::grpc::gcp::{HandshakeProtocol::Alts, StartClientHandshakeReq, StartServerHandshakeReq};
 use crate::grpc::gcp::handshaker_req::ReqOneof::{ClientStart, ServerStart, Next};
+use crate::grpc::gcp::identity::IdentityOneof;
 use crate::shared_alts_pb::AltsMessage;
 
 fn frame_message(m: AltsMessage) -> Vec<u8> {
@@ -90,10 +91,26 @@ impl<T: TLSAProvider> HandshakeProcessor<T> {
                     }
                 };
                 let is_last_message = {
-                    if let Some(_) = r.result {
+                    if let Some(ref result) = r.result {
+                        if let Some(sa) = match &result.peer_identity {
+                            None => None,
+                            Some(i) => match &i.identity_oneof {
+                                Some(IdentityOneof::ServiceAccount(sa)) => Some(sa),
+                                _ => None,
+                            },
+                        } {
+                            log::info!("Handshake completed successfully, peer is {}", sa);
+                        } else {
+                            log::info!("Handshake completed successfully but peer is unknown");
+                        }
                         true
                     } else if let Some(ref s) = r.status {
-                        s.code != Code::Ok as u32
+                        if s.code == Code::Ok as u32 {
+                            false
+                        } else {
+                            log::info!("Handshake failed with status {} and message {}", Code::from_i32(s.code.try_into().unwrap_or(Code::Unknown as i32)), s.details);
+                            true
+                        }
                     } else {
                         false
                     }
@@ -255,13 +272,13 @@ impl<T: TLSAProvider> HandshakerService for Handshaker<T> {
             Some(conn_info) => conn_info.peer_cred,
             None => None,
         }.ok_or_else(|| Status::new(Code::Unauthenticated, "No credentials from UNIX socket"))?;
-        log::info!("DoHandshake from {:?}", peer_cred);
         let username = match get_user_by_uid(peer_cred.uid()) {
             Some(user) => String::from(user.name().to_string_lossy()),
             None => {
                 return Err(Status::new(Code::Unauthenticated, "Peer uid corresponds to no user"));
             }
         };
+        log::info!("Starting handshake from {:?}", peer_cred);
         let p = HandshakeProcessor::new(&username, self.config.get(), ASN1Time::now(), self.resolver.clone());
         Ok(Response::new(Box::pin(p.run(req.into_inner()))))
     }

@@ -178,7 +178,6 @@ impl<T: TLSAProvider> Exchange<T> {
             application_protocols: self.application_protocols.clone(),
             rpc_versions: self.rpc_versions.take(),
         };
-        log::info!("generated SignedParams {:?}", p);
 
         let mut signed_params_bytes = Vec::new();
         signed_params_bytes.reserve(p.encoded_len());
@@ -218,7 +217,6 @@ impl<T: TLSAProvider> Exchange<T> {
 
         let signed_params = SignedParams::decode(Cursor::new(signed_params_bytes))
             .map_err(|err| Status::new(Code::Internal, format!("KeyExchange.signed_params decode failure: {}", err)))?;
-        log::info!("got SignedParams {:?}", signed_params);
         let named_curve = signed_params.named_curve
             .ok_or_else(|| Status::new(Code::InvalidArgument, "SignedParams.named_curve is unset"))?;
         if named_curve != NamedCurve::Secp256k1 as i32 {
