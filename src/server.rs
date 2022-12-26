@@ -21,6 +21,8 @@ use crate::grpc::gcp::handshaker_req::ReqOneof::{ClientStart, ServerStart, Next}
 use crate::grpc::gcp::identity::IdentityOneof;
 use crate::shared_alts_pb::AltsMessage;
 
+const MAX_ACCEPTED_MESSAGE_SIZE: usize = 20000;
+
 fn frame_message(m: AltsMessage) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.reserve(m.encoded_len());
@@ -230,6 +232,11 @@ impl<T: TLSAProvider> HandshakeProcessor<T> {
         }
         let header: [u8; 4] = self.available_bytes[0..4].try_into().unwrap();
         let msglen = u32::from_be_bytes(header) as usize;
+        if msglen > MAX_ACCEPTED_MESSAGE_SIZE {
+            // Prevent denial of service from the peer asking us to buffer
+            // an unreasonably huge number of bytes before decoding begins.
+            return Some(Err(Status::resource_exhausted("Handshake message too big")));
+        }
         if self.available_bytes.len() < 4 + msglen {
             return None;
         }

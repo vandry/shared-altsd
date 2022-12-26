@@ -17,7 +17,7 @@ use crate::grpc::gcp::{HandshakerResp, HandshakerStatus, ServerHandshakeParamete
 use crate::grpc::gcp::handshaker_req::ReqOneof::{ClientStart, ServerStart, Next};
 use crate::grpc::gcp::HandshakeProtocol::{Alts, Tls};
 use crate::grpc::gcp::{Identity, identity::IdentityOneof};
-use crate::shared_alts_pb::AltsMessage;
+use crate::shared_alts_pb::{AltsMessage, Hello};
 
 const TIME_WHEN_CERT_IS_VALID: i64 = 1671478511;
 
@@ -724,5 +724,56 @@ async fn test_server_rejects_duplicate_kex() {
             .expect_err("server rejects second kex from client")
             .message(),
         "Got duplicate KeyExchange message"
+    );
+}
+
+#[tokio::test]
+async fn test_client_rejects_message_too_big() {
+    let mut client = make_client(MockTLSAProvider::GoodFull);
+
+    client
+        .step(Ok(HandshakerReq {
+            req_oneof: Some(ClientStart(StartClientHandshakeReq {
+                handshake_security_protocol: Alts as i32,
+                record_protocols: vec![String::from("ALTSRP_GCM_AES128_REKEY")],
+                ..StartClientHandshakeReq::default()
+            })),
+        }))
+        .await
+        .expect("first HandshakerResp from client");
+
+    let msg = AltsMessage {
+        hello: Some(Hello {
+            magic: Some(String::from("wrong")),
+            ..Hello::default()
+        }),
+        ..AltsMessage::default()
+    };
+
+    let mut serialised = Vec::new();
+    serialised.reserve(msg.encoded_len());
+    msg.encode(&mut serialised).unwrap();
+
+    // Repeat the same message over and over until the result is big enough.
+    // Replicating a proto serialisation will lead to the same decoding.
+    let mut buf = Vec::new();
+    while buf.len() < 20000 {
+        buf.append(&mut serialised.clone());
+    }
+
+    let len = buf.len() as u32;
+    let framed_bytes = [len.to_be_bytes().to_vec(), buf].concat();
+
+    assert_eq!(
+        client
+            .step(Ok(HandshakerReq {
+                req_oneof: Some(Next(NextHandshakeMessageReq {
+                    in_bytes: framed_bytes,
+                })),
+            }))
+            .await
+            .expect_err("should reject message too big")
+            .code(),
+        Code::ResourceExhausted
     );
 }
