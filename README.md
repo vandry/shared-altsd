@@ -37,18 +37,14 @@ UNIX domain socket, by means of which shared-altsd knows the uid of the
 account it is acting for. It will cryptographically attest to the remote
 shared-altsd that the local identity is the corresponding username.
 
-Work in Progress
-================
+How to use
+==========
 
-This is only partially implemented! Especially important, we do not
-yet verify remote certificates!
-
-Also, the stock gRPC client libraries do not support connecting to an
+The stock gRPC client libraries do not support connecting to an
 ALTS server over UDS, requiring https://github.com/grpc/grpc/pull/31867
 and other forthcoming patches.
 
-Do not use this yet except for development! Nonetheless, here are
-instructions, such as they are:
+Run the ALTS server:
 
 ```
 $ cargo run /var/run/shared-alts/socket key_and_cert_in_same_file.pem
@@ -70,3 +66,22 @@ class GreeterServer(helloworld_pb2_grpc.GreeterServicer):
     def SayHello(self, request, context):
         peer = context.auth_context()['service_account'][0].decode()
 ```
+
+Installation
+============
+
+It is recommended to run shared-altsd under a dedicated user account.
+The daemon needs only access to its private key and certificate, and
+write access to the directory in which the listening socket will be
+created. No other account should be allowed to write the listening
+socket directory, ensuring that ALTS clients know they are connecting
+to the genuine local ALTS server.
+
+A script scripts/generate_rotate_shared_alts_key is provided which is
+intended to be run ~daily from cron. Because the script needs permission
+(in the form of a secret key for dynamic DNS updates) to create TLSA
+records in DNS that authorise new X.509 certificates for shared-altsd
+in perpetuity, this should be run from a different more privileged
+account, currently assumed to be root, but easily adaptable to do
+something else such as running on an offline remote machine or perhaps
+use an HSM.
