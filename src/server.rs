@@ -251,12 +251,12 @@ impl<T: TLSAProvider> HandshakeProcessor<T> {
 }
 
 pub struct Handshaker<T: TLSAProvider> {
-    config: Config,
+    config: Arc<Config>,
     resolver: Arc<T>,
 }
 
 impl<T: TLSAProvider> Handshaker<T> {
-    pub fn new(config: Config, resolver: Arc<T>) -> Self {
+    pub fn new(config: Arc<Config>, resolver: Arc<T>) -> Self {
         Self { config, resolver }
     }
 }

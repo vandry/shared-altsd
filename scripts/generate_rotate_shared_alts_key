@@ -140,7 +140,7 @@ maybe_renew() {
     # Removing this file is not essential, but it is less confusing.
     rm -f "$MARKER_FILE"
 
-    # TODO(vandry): Make the daemon reload.
+    killall -HUP shared-altsd
 }
 
 maybe_expire_old_records() {

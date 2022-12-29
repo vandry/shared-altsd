@@ -5,7 +5,8 @@ use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::iter;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use x509_parser::parse_x509_certificate;
 
 #[derive(Debug)]
@@ -88,6 +89,11 @@ fn read_certificate_and_key(mut reader: &mut dyn BufRead) -> Result<CertAndKey, 
         .as_str()
         .map_err(|_| CertAndKeyReadError::MissingCommonName)?
         .to_string();
+    log::info!(
+        "Loaded certificate with serial number {}",
+        cert.raw_serial_as_string()
+    );
+    log::info!("Certificate expires {}", cert.validity().not_after);
     Ok(CertAndKey {
         cert_bytes,
         common_name,
@@ -96,17 +102,16 @@ fn read_certificate_and_key(mut reader: &mut dyn BufRead) -> Result<CertAndKey, 
 }
 
 pub struct Config {
-    // TODO(vandry): This is a Arc<> so that it can be reloaded, for example
-    // on SIGHUP, and allow existing requests to continue using old CertAndKey.
-    // Do that.
-    cert_and_key: Arc<CertAndKey>,
+    cert_and_key: Mutex<Arc<CertAndKey>>,
+    filename: Option<PathBuf>,
 }
 
 impl Config {
-    pub fn new_from_file(filename: &std::path::Path) -> Result<Self, CertAndKeyReadError> {
+    pub fn new_from_file(filename: &Path) -> Result<Self, CertAndKeyReadError> {
         let f = File::open(filename).map_err(CertAndKeyReadError::IoError)?;
         Ok(Self {
-            cert_and_key: Arc::new(read_certificate_and_key(&mut BufReader::new(f))?),
+            cert_and_key: Mutex::new(Arc::new(read_certificate_and_key(&mut BufReader::new(f))?)),
+            filename: Some(filename.to_path_buf()),
         })
     }
 
@@ -114,11 +119,21 @@ impl Config {
     pub fn new_from_string(contents: &str) -> Result<Self, CertAndKeyReadError> {
         let mut f = std::io::Cursor::new(contents);
         Ok(Self {
-            cert_and_key: Arc::new(read_certificate_and_key(&mut f)?),
+            cert_and_key: Mutex::new(Arc::new(read_certificate_and_key(&mut f)?)),
+            filename: None,
         })
     }
 
     pub fn get(&self) -> Arc<CertAndKey> {
-        self.cert_and_key.clone()
+        self.cert_and_key.lock().unwrap().clone()
+    }
+
+    pub fn reload(&self) -> Result<(), CertAndKeyReadError> {
+        if let Some(ref filename) = self.filename {
+            let f = File::open(filename.as_path()).map_err(CertAndKeyReadError::IoError)?;
+            let cert_and_key = Arc::new(read_certificate_and_key(&mut BufReader::new(f))?);
+            *self.cert_and_key.lock().unwrap() = cert_and_key;
+        }
+        Ok(())
     }
 }

@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::UnixListener;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Code, Status, transport::Server};
 use trust_dns_proto::xfer::retry_dns_handle::RetryableError;
@@ -41,6 +42,7 @@ impl TLSAProvider for TokioAsyncResolver {
 }
 
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
     let args: Vec<_> = env::args_os().collect();
     if args.len() != 3 {
         eprintln!("Usage: {} listen-uds-socket-path certificate_and_key.pem",
@@ -48,7 +50,19 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(3);
     }
     let socket_path = Path::new(&args[1]);
-    let config = Config::new_from_file(Path::new(&args[2]))?;
+    let config_path = Path::new(&args[2]);
+    let config = Arc::new(Config::new_from_file(config_path)?);
+
+    let mut sighup = signal(SignalKind::hangup())?;
+    let config_for_reloading = config.clone();
+    tokio::spawn(async move {
+        loop {
+            sighup.recv().await;
+            if let Err(e) = config_for_reloading.reload() {
+                log::error!("Error reloading config: {}", e);
+            }
+        }
+    });
 
     let (resolver_config, mut resolver_opts) = read_system_conf()?;
     resolver_opts.validate = true;  // DNSSEC is essential
@@ -61,7 +75,6 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // use that subscriber to process traces emitted after this point
     tracing::subscriber::set_global_default(subscriber)?;
 
-    env_logger::init();
     let handshaker = Handshaker::new(config, Arc::new(resolver));
 
     let listener = match UnixListener::bind(socket_path) {
